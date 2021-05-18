@@ -153,7 +153,7 @@ struct rxr_rx_entry *rxr_ep_alloc_rx_entry(struct rxr_ep *ep, fi_addr_t addr, ui
 
 
 /* Post buffers as undirected recv (FI_ADDR_UNSPEC) */
-int rxr_ep_post_buf(struct rxr_ep *ep, const struct fi_msg *posted_recv, uint64_t flags, enum rxr_lower_ep_type lower_ep_type)
+int rxr_ep_post_buf(struct rxr_ep *ep, uint64_t flags, enum rxr_lower_ep_type lower_ep_type)
 {
 	struct fi_msg msg = {0};
 	struct iovec msg_iov;
@@ -166,16 +166,14 @@ int rxr_ep_post_buf(struct rxr_ep *ep, const struct fi_msg *posted_recv, uint64_
 		rx_pkt_entry = rxr_pkt_entry_alloc(ep, ep->rx_pkt_shm_pool);
 		break;
 	case EFA_EP:
-		if (posted_recv)
-			rx_pkt_entry = rxr_pkt_entry_init_prefix(ep, posted_recv, ep->rx_pkt_efa_pool);
-		else
-			rx_pkt_entry = rxr_pkt_entry_alloc(ep, ep->rx_pkt_efa_pool);
+		rx_pkt_entry = rxr_pkt_entry_alloc(ep, ep->rx_pkt_efa_pool);
 		break;
 	default:
 		FI_WARN(&rxr_prov, FI_LOG_EP_CTRL,
 			"invalid lower EP type %d\n", lower_ep_type);
 		assert(0 && "invalid lower EP type\n");
 	}
+
 	if (OFI_UNLIKELY(!rx_pkt_entry)) {
 		FI_WARN(&rxr_prov, FI_LOG_EP_CTRL,
 			"Unable to allocate rx_pkt_entry\n");
@@ -215,18 +213,6 @@ int rxr_ep_post_buf(struct rxr_ep *ep, const struct fi_msg *posted_recv, uint64_
 #endif
 		desc = fi_mr_desc(rx_pkt_entry->mr);
 		msg.desc = &desc;
-		/*
-		 * Use the actual receive sizes from the application
-		 * minus size of struct rxr_pkt_entry.
-		 * This is because we use the application buffer to
-		 * construct a pkt_entry, and use pkt_entry->pkt to
-		 * receive data.
-		 */
-		if (posted_recv) {
-			msg_iov.iov_len = posted_recv->msg_iov->iov_len - sizeof(struct rxr_pkt_entry);
-			msg.data = posted_recv->data;
-			assert(msg_iov.iov_len <= ep->mtu_size);
-		}
 		ret = fi_recvmsg(ep->rdm_ep, &msg, flags);
 		if (OFI_UNLIKELY(ret)) {
 			rxr_pkt_entry_release_rx(ep, rx_pkt_entry);
@@ -264,7 +250,6 @@ void rxr_tx_entry_init(struct rxr_ep *ep, struct rxr_tx_entry *tx_entry,
 	tx_entry->bytes_acked = 0;
 	tx_entry->bytes_sent = 0;
 	tx_entry->window = 0;
-	tx_entry->total_len = ofi_total_iov_len(msg->msg_iov, msg->iov_count);
 	tx_entry->iov_count = msg->iov_count;
 	tx_entry->iov_index = 0;
 	tx_entry->iov_mr_start = 0;
@@ -279,16 +264,13 @@ void rxr_tx_entry_init(struct rxr_ep *ep, struct rxr_tx_entry *tx_entry,
 	else
 		memset(tx_entry->desc, 0, sizeof(tx_entry->desc));
 
-	/*
-	 * The prefix is currently not used by the sender, but needs to be
-	 * accounted for when copying the payload into the bounce-buffer.
-	 */
-	if (ep->use_zcpy_rx) {
-		assert(tx_entry->iov[0].iov_len >= sizeof(struct rxr_pkt_entry) + sizeof(struct rxr_eager_msgrtm_hdr));
-		tx_entry->iov[0].iov_base = (char *)tx_entry->iov[0].iov_base
-					     + sizeof(struct rxr_pkt_entry)
-					     + sizeof(struct rxr_eager_msgrtm_hdr);
+	if (ep->msg_prefix_size) {
+		assert(tx_entry->iov[0].iov_len >= ep->msg_prefix_size);
+		tx_entry->iov[0].iov_base = (char *)tx_entry->iov[0].iov_base + ep->msg_prefix_size;
+		tx_entry->iov[0].iov_len -= ep->msg_prefix_size;
 	}
+
+	tx_entry->total_len = ofi_total_iov_len(tx_entry->iov, tx_entry->iov_count);
 
 	/* set flags */
 	assert(ep->util_ep.tx_msg_flags == 0 ||
@@ -860,7 +842,7 @@ static int rxr_ep_ctrl(struct fid *fid, int command, void *arg)
 			if (i == rx_size - 1)
 				flags = 0;
 
-			ret = rxr_ep_post_buf(ep, NULL, flags, EFA_EP);
+			ret = rxr_ep_post_buf(ep, flags, EFA_EP);
 
 			if (ret)
 				goto out;
@@ -898,7 +880,7 @@ static int rxr_ep_ctrl(struct fid *fid, int command, void *arg)
 				if (i == shm_rx_size - 1)
 					flags = 0;
 
-				ret = rxr_ep_post_buf(ep, NULL, flags, SHM_EP);
+				ret = rxr_ep_post_buf(ep, flags, SHM_EP);
 
 				if (ret)
 					goto out;
@@ -1358,7 +1340,7 @@ static inline int rxr_ep_bulk_post_recv(struct rxr_ep *ep)
 	while (ep->rx_bufs_efa_to_post) {
 		if (ep->rx_bufs_efa_to_post == 1)
 			flags = 0;
-		ret = rxr_ep_post_buf(ep, NULL, flags, EFA_EP);
+		ret = rxr_ep_post_buf(ep, flags, EFA_EP);
 		if (OFI_LIKELY(!ret))
 			ep->rx_bufs_efa_to_post--;
 		else
@@ -1369,7 +1351,7 @@ static inline int rxr_ep_bulk_post_recv(struct rxr_ep *ep)
 	while (ep->use_shm && ep->rx_bufs_shm_to_post) {
 		if (ep->rx_bufs_shm_to_post == 1)
 			flags = 0;
-		ret = rxr_ep_post_buf(ep, NULL, flags, SHM_EP);
+		ret = rxr_ep_post_buf(ep, flags, SHM_EP);
 		if (OFI_LIKELY(!ret))
 			ep->rx_bufs_shm_to_post--;
 		else
@@ -1842,8 +1824,9 @@ int rxr_endpoint(struct fid_domain *domain, struct fi_info *info,
 	assert(info->tx_attr->msg_order == info->rx_attr->msg_order);
 	rxr_ep->msg_order = info->rx_attr->msg_order;
 	rxr_ep->core_msg_order = rdm_info->rx_attr->msg_order;
-	rxr_ep->core_inject_size = rdm_info->tx_attr->inject_size;
+	rxr_ep->inject_size = info->tx_attr->inject_size;
 	rxr_ep->max_msg_size = info->ep_attr->max_msg_size;
+	rxr_ep->msg_prefix_size = info->ep_attr->msg_prefix_size;
 	rxr_ep->max_proto_hdr_size = rxr_pkt_max_header_size();
 	rxr_ep->mtu_size = rdm_info->ep_attr->max_msg_size;
 	fi_freeinfo(rdm_info);

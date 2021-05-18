@@ -75,6 +75,7 @@ struct rxr_env rxr_env = {
 	.efa_min_read_msg_size = 1048576,
 	.efa_min_read_write_size = 65536,
 	.efa_read_segment_size = 1073741824,
+	.rnr_retry = EFA_RNR_INFINITE_RETRY,
 };
 
 /* @brief Read and store the FI_EFA_* environment variables.
@@ -340,6 +341,7 @@ static int rxr_info_to_rxr(uint32_t version, const struct fi_info *core_info,
 {
 	uint64_t atomic_ordering;
 	uint64_t max_atomic_size;
+	uint64_t min_pkt_size;
 
 	info->caps = rxr_info.caps;
 	info->mode = rxr_info.mode;
@@ -349,8 +351,19 @@ static int rxr_info_to_rxr(uint32_t version, const struct fi_info *core_info,
 	*info->ep_attr = *rxr_info.ep_attr;
 	*info->domain_attr = *rxr_info.domain_attr;
 
-	/* TODO: update inject_size when we implement inject */
-	info->tx_attr->inject_size = 0;
+	/*
+	 * The requirement for inject is: upon return, the user buffer can be reused immediately.
+	 *
+	 * For EFA, inject is implement as: construct a packet entry, copy user data to packet entry
+	 * then send the packet entry. Therefore the maximum inject size is
+	 *    pkt_entry_size - maximum_header_size.
+	 */
+	if (rxr_env.enable_shm_transfer)
+		min_pkt_size = MIN(core_info->ep_attr->max_msg_size, rxr_env.shm_max_medium_size);
+	else
+		min_pkt_size = core_info->ep_attr->max_msg_size;
+
+	info->tx_attr->inject_size = min_pkt_size - rxr_pkt_max_header_size();
 	rxr_info.tx_attr->inject_size = info->tx_attr->inject_size;
 
 	info->addr_format = core_info->addr_format;
@@ -476,11 +489,15 @@ static int rxr_info_to_rxr(uint32_t version, const struct fi_info *core_info,
 			info->rx_attr->mode |= FI_MSG_PREFIX;
 
 			/*
-			 * The prefix needs to be a multiple of 8. The pkt_entry
-			 * is already at 64 bytes (128 with debug).
+			 * Per libfabric standard, the prefix must be a multiple of 8:
+			 *     sizeof(struct pkt_entry) is multiple of 64.
+			 *     sizeof(struct rxr_eager_msgrtm_hdr) is 8.
+			 *     rxr_req_opt_raw_addr_hdr_size() will always be multiple of 8.
+			 * so we are good.
 			 */
-			info->ep_attr->msg_prefix_size =  sizeof(struct rxr_pkt_entry)
-							  + sizeof(struct rxr_eager_msgrtm_hdr);
+			info->ep_attr->msg_prefix_size = sizeof(struct rxr_pkt_entry) +
+							 sizeof(struct rxr_eager_msgrtm_hdr) +
+							 rxr_req_opt_raw_addr_hdr_size();
 			assert(!(info->ep_attr->msg_prefix_size % 8));
 			FI_INFO(&rxr_prov, FI_LOG_CORE,
 				"FI_MSG_PREFIX size = %ld\n", info->ep_attr->msg_prefix_size);

@@ -91,6 +91,11 @@
 #define EFA_MR_SUPPORTED_PERMISSIONS (FI_SEND | FI_RECV | FI_REMOTE_READ)
 
 /*
+ * Setting ibv_qp_attr.rnr_retry to this number when modifying qp
+ * to cause firmware to retry indefininetly.
+ */
+#define EFA_RNR_INFINITE_RETRY 7
+/*
  * Multiplier to give some room in the device memory registration limits
  * to allow processes added to a running job to bootstrap.
  */
@@ -424,6 +429,18 @@ bool efa_ep_support_rnr_retry_modify(struct fid_ep *ep_fid)
 #else
 	return false;
 #endif
+}
+
+/**
+ * @brief return whether this endpoint will write error cq entry for RNR
+ *
+ * @param[in]	ep	endpoint
+ */
+static inline
+bool rxr_ep_write_rnr_completion(struct rxr_ep *ep)
+{
+	return (rxr_env.rnr_retry < EFA_RNR_INFINITE_RETRY) &&
+		(ep->handle_resource_management == FI_RM_DISABLED);
 }
 
 static inline

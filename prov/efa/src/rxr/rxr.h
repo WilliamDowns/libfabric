@@ -175,6 +175,10 @@ static inline void rxr_poison_mem_region(uint32_t *ptr, size_t size)
  */
 #define RXR_LONGCTS_PROTOCOL BIT_ULL(8)
 
+/* Flag to tell whether data has been copied to bounce buffer for send
+ */
+#define RXR_DATA_COPIED_FOR_SEND BIT_ULL(9)
+
 /*
  * OFI flags
  * The 64-bit flag field is used as follows:
@@ -236,6 +240,17 @@ struct rxr_env {
 	size_t efa_min_read_msg_size;
 	size_t efa_min_read_write_size;
 	size_t efa_read_segment_size;
+	/* If first attempt to send a packet failed,
+	 * this value controls how many times firmware
+	 * retries the send before it report an RNR error
+	 * (via rdma-core error cq entry).
+	 *
+	 * The valid number is from
+	 *      0 (no retry)
+	 * to
+	 *      EFA_RNR_INFINITY_RETRY (retry infinitely)
+	 */
+	int rnr_retry;
 };
 
 enum rxr_lower_ep_type {
@@ -567,7 +582,7 @@ struct rxr_ep {
 	/* rx/tx queue size of core provider */
 	size_t core_rx_size;
 	size_t max_outstanding_tx;
-	size_t core_inject_size;
+	size_t inject_size;
 	size_t max_data_payload_size;
 
 	/* Resource management flag */
@@ -580,6 +595,9 @@ struct rxr_ep {
 
 	/* Application's maximum msg size hint */
 	size_t max_msg_size;
+
+	/* Applicaiton's message prefix size. */
+	size_t msg_prefix_size;
 
 	/* RxR protocol's max header size */
 	size_t max_proto_hdr_size;
@@ -876,8 +894,8 @@ int rxr_endpoint(struct fid_domain *domain, struct fi_info *info,
 /* EP sub-functions */
 void rxr_ep_progress(struct util_ep *util_ep);
 void rxr_ep_progress_internal(struct rxr_ep *rxr_ep);
-int rxr_ep_post_buf(struct rxr_ep *ep, const struct fi_msg *posted_recv,
-		    uint64_t flags, enum rxr_lower_ep_type lower_ep);
+int rxr_ep_post_buf(struct rxr_ep *ep, uint64_t flags,
+		    enum rxr_lower_ep_type lower_ep);
 
 int rxr_ep_set_tx_credit_request(struct rxr_ep *rxr_ep,
 				 struct rxr_tx_entry *tx_entry);

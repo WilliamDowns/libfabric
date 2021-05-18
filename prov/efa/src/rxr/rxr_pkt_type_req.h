@@ -83,6 +83,8 @@ struct rxr_req_opt_raw_addr_hdr {
 	char raw_addr[0];
 };
 
+size_t rxr_req_opt_raw_addr_hdr_size();
+
 struct rxr_req_opt_cq_data_hdr {
 	int64_t cq_data;
 };
@@ -387,13 +389,8 @@ ssize_t rxr_pkt_init_read_tagrtm(struct rxr_ep *ep,
 /*
  *   handle_sent() functions for RTM packets
  */
-static inline
 void rxr_pkt_handle_eager_rtm_sent(struct rxr_ep *ep,
-				   struct rxr_pkt_entry *pkt_entry)
-{
-	/* there is nothing to be done for eager RTM */
-	return;
-}
+				   struct rxr_pkt_entry *pkt_entry);
 
 void rxr_pkt_handle_medium_rtm_sent(struct rxr_ep *ep,
 				    struct rxr_pkt_entry *pkt_entry);
@@ -444,11 +441,6 @@ ssize_t rxr_pkt_proc_matched_rtm(struct rxr_ep *ep,
 
 ssize_t rxr_pkt_proc_rtm_rta(struct rxr_ep *ep,
 			     struct rxr_pkt_entry *pkt_entry);
-/*
- *         This function handles zero-copy receives that do not require ordering
- */
-void rxr_pkt_handle_zcpy_recv(struct rxr_ep *ep,
-			      struct rxr_pkt_entry *pkt_entry);
 /*
  *         This function is shared by all RTM packet types which handle
  *         reordering

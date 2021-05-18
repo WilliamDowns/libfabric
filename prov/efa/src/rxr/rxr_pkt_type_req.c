@@ -93,6 +93,19 @@ struct rxr_req_inf REQ_INF_LIST[] = {
 	[RXR_COMPARE_RTA_PKT] = {4, sizeof(struct rxr_rta_hdr), 0},
 };
 
+/*
+ * @brief return optional raw address header size
+ *        optional raw address header is part of req packet header.
+ *
+ * @return the optional raw address header size, which is multiple of 8.
+ */
+size_t rxr_req_opt_raw_addr_hdr_size()
+{
+	size_t alignment = 8;
+	size_t hdr_size = sizeof(struct rxr_req_opt_raw_addr_hdr) + EFA_EP_ADDR_LEN;
+	return ((hdr_size - 1)/alignment + 1) * alignment;
+}
+
 size_t rxr_pkt_req_data_size(struct rxr_pkt_entry *pkt_entry)
 {
 	size_t hdr_size;
@@ -138,9 +151,10 @@ void rxr_pkt_init_req_hdr(struct rxr_ep *ep,
 		struct rxr_req_opt_raw_addr_hdr *raw_addr_hdr;
 
 		raw_addr_hdr = (struct rxr_req_opt_raw_addr_hdr *)opt_hdr;
-		raw_addr_hdr->addr_len = ep->core_addrlen;
-		memcpy(raw_addr_hdr->raw_addr, ep->core_addr, raw_addr_hdr->addr_len);
-		opt_hdr += sizeof(*raw_addr_hdr) + raw_addr_hdr->addr_len;
+		raw_addr_hdr->addr_len = rxr_req_opt_raw_addr_hdr_size() - sizeof(struct rxr_req_opt_raw_addr_hdr);
+		assert(raw_addr_hdr->addr_len >= ep->core_addrlen);
+		memcpy(raw_addr_hdr->raw_addr, ep->core_addr, ep->core_addrlen);
+		opt_hdr += rxr_req_opt_raw_addr_hdr_size();
 	}
 
 	if (base_hdr->flags & RXR_REQ_OPT_CQ_DATA_HDR) {
@@ -359,6 +373,7 @@ void rxr_pkt_req_data_from_tx(struct rxr_ep *ep, struct rxr_pkt_entry *pkt_entry
 	assert(copied == data_size);
 	pkt_entry->send->iov_count = 0;
 	pkt_entry->pkt_size = hdr_size + copied;
+	tx_entry->rxr_flags |= RXR_DATA_COPIED_FOR_SEND;
 }
 
 static inline
@@ -610,9 +625,36 @@ ssize_t rxr_pkt_init_read_tagrtm(struct rxr_ep *ep,
  *     handle_sent() functions
  */
 
-/*
- *         rxr_pkt_handle_eager_rtm_sent() is empty and is defined in rxr_pkt_type_req.h
+/**
+ * @brief handler for an eager rtm packet has been sent
+ *
+ * @param[in]	ep		end point
+ * @param[in]	pkt_entry	eager rtm packet entry
  */
+void rxr_pkt_handle_eager_rtm_sent(struct rxr_ep *ep,
+				    struct rxr_pkt_entry *pkt_entry)
+{
+	struct rxr_tx_entry *tx_entry;
+
+	/*
+	 * we can write completion here if the following two
+	 * conditions are met:
+	 *
+	 *  1. Data has been copied to bounce buffer. This ensures
+	 *     user's send buffer can be reused when they get completion.
+	 *
+	 *  2. Application want proivder to manage RNR retries.
+	 *     Otherwise we have wait for rdma-core completion to
+	 *     know whether RNR happened.
+	 */
+	tx_entry = pkt_entry->x_entry;
+	assert(tx_entry);
+	if ((tx_entry->rxr_flags & RXR_DATA_COPIED_FOR_SEND) &&
+	    !rxr_ep_write_rnr_completion(ep)) {
+		rxr_cq_write_tx_completion(ep, tx_entry);
+	}
+}
+
 void rxr_pkt_handle_medium_rtm_sent(struct rxr_ep *ep,
 				    struct rxr_pkt_entry *pkt_entry)
 {
@@ -650,7 +692,13 @@ void rxr_pkt_handle_eager_rtm_send_completion(struct rxr_ep *ep,
 
 	tx_entry = (struct rxr_tx_entry *)pkt_entry->x_entry;
 	assert(tx_entry->total_len == rxr_pkt_req_data_size(pkt_entry));
-	rxr_cq_handle_tx_completion(ep, tx_entry);
+	/*
+	 * For eager rtm, it is possible the completion has already been
+	 * written. In which case, the RXR_NO_COMPLETION flag will be set.
+	 */
+	if (!(tx_entry->fi_flags & RXR_NO_COMPLETION))
+		rxr_cq_write_tx_completion(ep, tx_entry);
+	rxr_release_tx_entry(ep, tx_entry);
 }
 
 void rxr_pkt_handle_medium_rtm_send_completion(struct rxr_ep *ep,
@@ -1173,53 +1221,6 @@ ssize_t rxr_pkt_proc_rtm_rta(struct rxr_ep *ep,
 	}
 
 	return -FI_EINVAL;
-}
-
-void rxr_pkt_handle_zcpy_recv(struct rxr_ep *ep,
-			      struct rxr_pkt_entry *pkt_entry)
-{
-	struct rxr_rx_entry *rx_entry;
-
-	struct rxr_base_hdr *base_hdr __attribute__((unused));
-	base_hdr = rxr_get_base_hdr(pkt_entry->pkt);
-	assert(base_hdr->type >= RXR_BASELINE_REQ_PKT_BEGIN);
-	assert(base_hdr->type != RXR_MEDIUM_MSGRTM_PKT);
-	assert(base_hdr->type != RXR_MEDIUM_TAGRTM_PKT);
-	assert(base_hdr->type != RXR_DC_MEDIUM_MSGRTM_PKT);
-	assert(base_hdr->type != RXR_DC_MEDIUM_MSGRTM_PKT);
-	assert(pkt_entry->type == RXR_PKT_ENTRY_USER);
-
-	rx_entry = rxr_pkt_get_msgrtm_rx_entry(ep, &pkt_entry);
-	if (OFI_UNLIKELY(!rx_entry)) {
-		efa_eq_write_error(&ep->util_ep, FI_ENOBUFS, -FI_ENOBUFS);
-		rxr_pkt_entry_release_rx(ep, pkt_entry);
-		return;
-	}
-	pkt_entry->x_entry = rx_entry;
-	if (rx_entry->state != RXR_RX_MATCHED)
-		return;
-
-	/*
-	 * The incoming receive will always get matched to the first posted
-	 * rx_entry available, so this is a constant cost. No real tag or
-	 * address matching happens.
-	 */
-	assert(rx_entry->state == RXR_RX_MATCHED);
-
-	/*
-	 * Adjust rx_entry->cq_entry.len as needed.
-	 * Initialy rx_entry->cq_entry.len is total recv buffer size.
-	 * rx_entry->total_len is from REQ packet and is total send buffer size.
-	 * if send buffer size < recv buffer size, we adjust value of rx_entry->cq_entry.len
-	 * if send buffer size > recv buffer size, we have a truncated message and will
-	 * write error CQ entry.
-	 */
-	if (rx_entry->cq_entry.len > rx_entry->total_len)
-		rx_entry->cq_entry.len = rx_entry->total_len;
-
-	rxr_cq_write_rx_completion(ep, rx_entry);
-	rxr_pkt_entry_release_rx(ep, pkt_entry);
-	rxr_release_rx_entry(ep, rx_entry);
 }
 
 void rxr_pkt_handle_rtm_rta_recv(struct rxr_ep *ep,
